@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract Subscription {
+    address public owner;
+    mapping(address => bool) public subscribers;
+    uint256 public subscriptionFee = 10 * 10**18; // $10 in HBAR (approximate)
+    uint256 public subscriptionDuration = 30 days;
+
+    event Subscribed(address indexed user, uint256 expiry);
+    event Unsubscribed(address indexed user);
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    function subscribe() external payable {
+        require(msg.value >= subscriptionFee, "Insufficient payment");
+        subscribers[msg.sender] = true;
+        emit Subscribed(msg.sender, block.timestamp + subscriptionDuration);
+    }
+
+    function unsubscribe() external {
+        require(subscribers[msg.sender], "Not subscribed");
+        subscribers[msg.sender] = false;
+        emit Unsubscribed(msg.sender);
+    }
+
+    function isSubscribed(address user) external view returns (bool) {
+        return subscribers[user];
+    }
+
+    function withdraw() external onlyOwner {
+        payable(owner).transfer(address(this).balance);
+    }
+}

@@ -1,0 +1,27 @@
+name: supergrok_trading_saas
+description: A SaaS trading app powered by SuperGrok for NZ
+version: 1.1.0
+
+environment:
+  sdk: ">=2.12.0 <3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^0.13.5
+  provider: ^6.0.5
+  fl_chart: ^0.55.2
+  firebase_messaging: ^14.2.1
+  flutter_stripe: ^9.0.0
+  web_socket_channel: ^2.4.0
+  flutter_secure_storage: ^8.0.0
+  hedera_sdk: ^0.4.0
+  dio: ^5.0.0
+  url_launcher: ^6.1.10  # For NOWPayments redirect
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

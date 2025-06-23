@@ -1,0 +1,330 @@
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter_stripe/flutter_stripe.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:hedera_sdk/hedera_sdk.dart';
+import 'package:dio/dio.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await FirebaseMessaging.instance.requestPermission();
+  Stripe.publishableKey = 'pk_test_YOUR_STRIPE_PUBLISHABLE_KEY';
+  await Stripe.instance.applySettings();
+  runApp(SuperGrokSaaSApp());
+}
+
+class SuperGrokSaaSApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'SuperGrok Trading SaaS',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      initialRoute: '/login',
+      routes: {
+        '/login': (context) => LoginScreen(),
+        '/dashboard': (context) => DashboardScreen(),
+        '/subscribe': (context) => SubscriptionScreen(),
+      },
+    );
+  }
+}
+
+class LoginScreen extends StatefulWidget {
+  @override
+  _LoginScreenState createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+  final storage = FlutterSecureStorage();
+
+  Future<void> login() async {
+    final response = await http.post(
+      Uri.parse('https://api.supergrok.nz/api/login'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'email': emailController.text,
+        'password': passwordController.text,
+      }),
+    );
+    if (response.statusCode == 200) {
+      await storage.write(key: 'auth_token', value: jsonDecode(response.body)['token']);
+      Navigator.pushReplacementNamed(context, '/dashboard');
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Login failed')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('Login')),
+      body: Padding(
+        padding: EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            TextField(controller: emailController, decoration: InputDecoration(labelText: 'Email')),
+            TextField(controller: passwordController, obscureText: true, decoration: InputDecoration(labelText: 'Password')),
+            SizedBox(height: 20),
+            ElevatedButton(onPressed: login, child: Text('Login')),
+            TextButton(
+              onPressed: () => Navigator.pushNamed(context, '/subscribe'),
+              child: Text('Subscribe Now'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class DashboardScreen extends StatefulWidget {
+  @override
+  _DashboardScreenState createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  Map<String, dynamic>? marketData;
+  bool isSuperGrokActive = false;
+  List<FlSpot> portfolioHistory = [];
+  WebSocketChannel? channel;
+  final storage = FlutterSecureStorage();
+
+  @override
+  void initState() {
+    super.initState();
+    connectWebSocket();
+    setupNotifications();
+    if (isSuperGrokActive) startSuperGrok();
+  }
+
+  Future<void> connectWebSocket() async {
+    final token = await storage.read(key: 'auth_token');
+    channel = WebSocketChannel.connect(Uri.parse('wss://api.supergrok.nz/market-data?token=$token'));
+    channel!.stream.listen((data) {
+      setState(() {
+        marketData = jsonDecode(data);
+        portfolioHistory.add(FlSpot(DateTime.now().millisecondsSinceEpoch.toDouble(), marketData!['portfolio_value']));
+        if (portfolioHistory.length > 50) portfolioHistory.removeAt(0);
+      });
+    }, onError: (error) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('WebSocket error: $error')));
+    });
+  }
+
+  Future<void> setupNotifications() async {
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message.notification?.body ?? 'New trade executed')));
+    });
+  }
+
+  Future<void> toggleSuperGrok() async {
+    setState(() => isSuperGrokActive = !isSuperGrokActive);
+    final token = await storage.read(key: 'auth_token');
+    final response = await http.post(
+      Uri.parse('https://api.supergrok.nz/api/subscription/check'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 403) {
+      Navigator.pushNamed(context, '/subscribe');
+      setState(() => isSuperGrokActive = false);
+      return;
+    }
+    if (isSuperGrokActive) startSuperGrok();
+  }
+
+  Future<void> startSuperGrok() async {
+    while (isSuperGrokActive) {
+      final token = await storage.read(key: 'auth_token');
+      final response = await http.post(Uri.parse('https://ai.supergrok.nz/predict'), headers: {'Authorization': 'Bearer $token'});
+      final trade = jsonDecode(response.body);
+      await http.post(
+        Uri.parse('https://api.supergrok.nz/api/trade'),
+        headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+        body: jsonEncode(trade),
+      );
+      await Future.delayed(Duration(seconds: 30));
+    }
+  }
+
+  Future<void> taxLossHarvest() async {
+    final token = await storage.read(key: 'auth_token');
+    final response = await http.post(
+      Uri.parse('https://api.supergrok.nz/api/tax-loss-harvest'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Tax-loss harvesting completed')));
+    }
+  }
+
+  @override
+  void dispose() {
+    channel?.sink.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('SuperGrok Dashboard')),
+      body: marketData == null
+          ? Center(child: CircularProgressIndicator())
+          : Padding(
+              padding: EdgeInsets.all(16.0),
+              child: Column(
+                children: [
+                  Text('Portfolio: \$${marketData!['portfolio_value'].toStringAsFixed(2)}', style: TextStyle(fontSize: 20)),
+                  SizedBox(height: 10),
+                  Text('SPK.NZ: \$${marketData!['prices']['SPK.NZ'].toStringAsFixed(2)}'),
+                  Text('BTC: \$${marketData!['prices']['BTC'].toStringAsFixed(2)}'),
+                  SizedBox(height: 20),
+                  Container(
+                    height: 200,
+                    child: LineChart(
+                      LineChartData(
+                        titlesData: FlTitlesData(show: false),
+                        lineBarsData: [
+                          LineChartBarData(spots: portfolioHistory, isCurved: true, colors: [Colors.blue]),
+                        ],
+                      ),
+                    ),
+                  ),
+                  SizedBox(height: 20),
+                  ElevatedButton(
+                    onPressed: toggleSuperGrok,
+                    child: Text(isSuperGrokActive ? 'Stop SuperGrok' : 'Start SuperGrok'),
+                  ),
+                  ElevatedButton(
+                    onPressed: taxLossHarvest,
+                    child: Text('Run Tax-Loss Harvesting'),
+                  ),
+                ],
+              ),
+            ),
+    );
+  }
+}
+
+class SubscriptionScreen extends StatefulWidget {
+  @override
+  _SubscriptionScreenState createState() => _SubscriptionScreenState();
+}
+
+class _SubscriptionScreenState extends State<SubscriptionScreen> {
+  final storage = FlutterSecureStorage();
+  bool useHedera = false;
+
+  Future<void> subscribeWithStripe(BuildContext context) async {
+    try {
+      final token = await storage.read(key: 'auth_token');
+      final response = await http.post(
+        Uri.parse('https://api.supergrok.nz/api/subscription/stripe'),
+        headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+      );
+      final session = jsonDecode(response.body);
+      await Stripe.instance.initPaymentSheet(
+        paymentSheetParameters: SetupPaymentSheetParameters(
+          paymentIntentClientSecret: session['clientSecret'],
+          merchantDisplayName: 'SuperGrok Trading',
+        ),
+      );
+      await Stripe.instance.presentPaymentSheet();
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Subscription successful!')));
+      Navigator.pushReplacementNamed(context, '/dashboard');
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Stripe payment failed: $e')));
+    }
+  }
+
+  Future<void> subscribeWithHedera(BuildContext context) async {
+    try {
+      final token = await storage.read(key: 'auth_token');
+      final client = Client.forMainnet();
+      client.setOperator(
+        AccountId.fromString('USER_HEDERA_ACCOUNT_ID'), // Prompt user for their account
+        PrivateKey.fromString('USER_HEDERA_PRIVATE_KEY'),
+      );
+
+      const hbarPrice = 0.20; // HBAR price in USD (update dynamically)
+      final hbarAmount = Hbar.from(10.0 / hbarPrice); // $10 subscription
+      final transaction = TransferTransaction()
+        ..addHbarTransfer(AccountId.fromString('SUPER_GROK_ACCOUNT_ID'), hbarAmount)
+        ..addHbarTransfer(AccountId.fromString('USER_HEDERA_ACCOUNT_ID'), hbarAmount.negated);
+
+      final response = await transaction.execute(client);
+      final receipt = await response.getReceipt(client);
+
+      if (receipt.status == Status.success) {
+        await http.post(
+          Uri.parse('https://api.supergrok.nz/api/subscription/hedera'),
+          headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+          body: jsonEncode({'transactionId': response.transactionId.toString()}),
+        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Hedera subscription successful!')));
+        Navigator.pushReplacementNamed(context, '/dashboard');
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Hedera payment failed: $e')));
+    }
+  }
+
+  Future<void> subscribeWithNOWPayments(BuildContext context) async {
+    try {
+      final dio = Dio();
+      final response = await dio.post(
+        'https://api.nowpayments.io/v1/invoice',
+        data: {
+          'price_amount': 10.0,
+          'price_currency': 'usd',
+          'order_id': 'SUBSCRIPTION_${DateTime.now().millisecondsSinceEpoch}',
+          'order_description': 'SuperGrok Premium Subscription',
+          'ipn_callback_url': 'https://api.supergrok.nz/api/webhook/nowpayments',
+          'success_url': 'https://app.supergrok.nz/success',
+          'cancel_url': 'https://app.supergrok.nz/cancel',
+        },
+        options: Options(headers: {'x-api-key': 'YOUR_NOWPAYMENTS_API_KEY'}),
+      );
+      final invoiceUrl = response.data['invoice_url'];
+      await launch(invoiceUrl); // Open payment page
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('NOWPayments failed: $e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('Subscribe')),
+      body: Padding(
+        padding: EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            Text('Free Plan: 5 trades/month', style: TextStyle(fontSize: 18)),
+            Text('Premium Plan: Unlimited trades for $10/month', style: TextStyle(fontSize: 18)),
+            SizedBox(height: 20),
+            SwitchListTile(
+              title: Text('Pay with Hedera (HBAR)'),
+              value: useHedera,
+              onChanged: (value) => setState(() => useHedera = value),
+            ),
+            ElevatedButton(
+              onPressed: () => useHedera ? subscribeWithHedera(context) : subscribeWithStripe(context),
+              child: Text(useHedera ? 'Subscribe with Hedera' : 'Subscribe with Stripe'),
+            ),
+            ElevatedButton(
+              onPressed: () => subscribeWithNOWPayments(context),
+              child: Text('Subscribe with NOWPayments (HBAR/Fiat)'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
