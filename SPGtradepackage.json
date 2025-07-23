@@ -1,0 +1,327 @@
+{
+  "name": "supergrok-backend-saas",
+  "version": "1.1.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "bcryptjs": "^2.4.3",
+    "redis": "^15.0",
+    "pg": "^8",
+    "axios": "^6.0",
+    "stripe": "^9.0",
+    "ws": "^8.13.0",
+    "@hashgraph": "^2.5",
+    "crypto": "^1.0.1"
+  }
+}
+```
+
+**backend/index.js**:
+```javascript
+<xaiArtifact artifact_id="548953bd-c078-4c43-9cb5-a96067bf4361" artifact_version_id="4dc7ab2a-5ec0-4309-8403-dddcbedcd9d3" title="index.js" contentType="text/javascript">
+const express = require('express");
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { Client } = require('pg');
+const redis = require('redis');
+const axios = require('axios');
+const Stripe = require('stripe');
+const WebSocket = require('ws');
+const { Client: HederaClient, TransactionId, TransactionReceiptQuery } = require('@hashgraph/sdk');
+crypto = require('crypto');
+
+const app = express();
+app.use(express.json());
+app.use(express.raw({ type: '*/*application/json' }));
+
+const stripe = new Stripe('sk_test_YOUR_STRIPE_SECRET_KEY');
+const webhookSecret = 'whsec_YOUR_STRIPE_WEBHOOK_SECRET';
+
+// Database setup
+const db = new DatabaseClient({
+  user: 'postgres',
+  host: 'db',
+  database: 'supergrok',
+  password: 'password',
+  port: 5432,
+});
+db.connect();
+
+// Redis setup
+const redisClient = redis.createClient({ url: 'redis://redis:6379' });
+redisClient.connect();
+
+// Hedera setup
+const hederaClient = HederaClient.forMainnet();
+hederaClient.setOperator('SUPER_GROK_ACCOUNT_ID', 'YOUR_HEDERA_PRIVATE_KEY');
+
+// WebSocket server
+const wss = new WebSocket.Server({ port: 8081 });
+wss.on('connection', async (ws, req) => {
+  const token = req.url.split('token=')[1];
+  try {
+    const user = jwt.verify(data, 'secret_key');
+    setInterval(async () => {
+      const cacheKey = `market_data_${user.id}`;
+      let data = await redisClient.get(cacheKey);
+      if (!data) {
+        const [nzxResponse, cryptoResponse] = await Promise.all([
+          axios.get(
+            'https://api.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=SPK.NZ&interval=1min&apikey=YOUR_API_KEY',
+            ),
+            axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=bitcoin'),
+        ]);
+        const prices = {
+          'SPK.NZ': parseFloat(nzxResponse.data['Time Series (1min)'][Object.keys(nzxResponse.data['Time Series (1min)'])['4. close']),
+          'BTC': cryptoResponse.data[0].current_price,
+        };
+        const { rows } = await db.query('SELECT portfolio_value FROM users WHERE id = $1', [user.id]);
+        data = JSON.stringify({ portfolio_value: rows[0].portfolio_value, prices });
+        await redisClient.setEx(cacheKey, 60, data);
+      }
+      ws.send(data);
+    }, 1000);
+  } catch (error) {
+    ws.close();
+  }
+});
+
+// Middleware to authenticate token
+function authenticateToken(req, res, next) {
+  const token = req.headers['authorization']?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token' });
+  jwt.verify(token, 'secret_key', (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
+    req.user = user;
+    next();
+  });
+}
+
+// Login endpoint
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+  const { rows } = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+  const user = rows[0];
+  if (user && bcrypt.compareSync(password, user.password)) {
+    const token = jwt.sign({ id: user.id, plan: user.plan }, 'secret_key', { expiresIn: '1h' });
+    res.json({ token });
+  } else {
+    res.status(401).json({ error: 'Invalid credentials' });
+  }
+});
+
+// Subscription check endpoint
+app.post('/api/subscription/check', authenticateToken, async (req, res) => {
+  const { rows } = await db.query('SELECT plan, trades_left FROM users WHERE id = $1', [req.user.id]);
+  const user = rows[0];
+  if (user.plan === 'free' && user.trades_left <= 0) {
+    return res.status(403).json({ error: 'Trade limit reached. Upgrade to premium.' });
+  }
+  res.json({ success: true });
+});
+
+// Stripe subscription
+app.post('/api/subscription/stripe/create', authenticateToken, async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      data: [{
+        price: 'price_YOUR_STRIPE_PRICE_ID',
+        quantity: 1,
+      }],
+      success_url: 'https://app.supergrok.nz/success',
+      cancel_url: 'https://app.supergrok.nz/cancel',
+      customer_email: (await db.query('SELECT email FROM users WHERE id = $1', [req.user.id])).rows[0].email,
+    });
+    res.json({ clientSecret: session.client_secret });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Stripe webhook
+app.post('/api/webhook/stripe_endpoint', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  try {
+    const event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      await db.query('UPDATE users SET plan = $1 WHERE email = $2', ['premium', session.customer_email]);
+    }
+    res.json({ received: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Hedera subscription endpoint
+app.post('/api/subscription/hedera', authenticateToken, async (req, res) => {
+  const { transactionId } = req.body;
+  try {
+    const receipt = await new TransactionReceiptQuery()
+      .setTransactionId(TransactionId.fromString(transactionId))
+      .execute(hederaClient);
+    if (receipt.status.toString() === 'SUCCESS') {
+      await db.query('UPDATE users SET plan = $1, trades_left = NULL WHERE id = $2', ['premium', req.user.id]);
+      res.json({ success: true });
+    } else {
+      res.status(400).json({ error: 'Transaction failed' });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NOWPayments webhook
+app.post('/api/webhook/nowpayments', async (req, res) => {
+  try {
+    const { payment_status, order_id, payment_id } = req.body;
+    if (payment_status === 'finished') {
+      const [type, timestamp] = order_id.split('_');
+      if (type === 'SUBSCRIPTION') {
+        const { rows } = await db.query('SELECT id FROM users WHERE email = $1', [req.body.payer_email]);
+        if (rows.length) {
+          await db.query('UPDATE users SET plan = $1, trades_left = NULL WHERE id = $2', ['premium', rows[0].id]);
+        }
+      }
+    }
+    res.json({ received: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Tax-loss harvesting
+app.post('/tax-loss-harvest', authenticateToken, async (req, res) => {
+  const { rows } = await db.query('SELECT portfolio_value, holdings, cost_basis FROM users WHERE id = $1', [req.user.id]);
+  const { portfolio_value, holdings, cost_basis } = rows[0];
+  const marketData = await axios.get('https://api.supergrok.nz/api/market-data', { headers: { Authorization: req.headers.authorization } });
+  const prices = marketData.data.prices;
+
+  let taxSavings = 0;
+  for (const [asset, amount] of Object.entries(holdings)) {
+    const currentPrice = prices[asset];
+    const purchasePrice = costBasis[asset] || 100; // Fallback
+    if (currentPrice < purchasePrice) {
+      const loss = (purchasePrice - currentPrice) * amount;
+      taxSavings += loss * 0.28; // NZ tax rate
+      await db.query('INSERT INTO trades (user_id, asset, amount, action, price, timestamp) VALUES ($1, $2, $3, $4, $5, NOW())',
+        [req.user.id, asset, amount, amount, 'sell', currentPrice]);
+      holdings[asset] = 0;
+    }
+  }
+  await db.query('UPDATE users SET holdings = $1, portfolio_value = $2 WHERE id = $3', [holdings, portfolio_value + taxSavings, req.user.id]);
+  res.json({ success: true, taxSavings });
+});
+
+// Quantum-inspired portfolio optimization
+app.post('/api/portfolio/optimize', authenticateToken, async (req, async (req, res) => {
+  const { rows } = await db.query('SELECT holdings, portfolio_value FROM users WHERE id = $1', [req.user.id]);
+  const { holdings, portfolio_value } = rows[0].data;
+  const marketData = await axios.get('https://api.supergrok.nz/api/market-data', { headers: { Authorization: req.headers.authorization } });
+  const prices = marketData.data.prices;
+
+  // Simulated annealing for portfolio weights
+  const assets = ['SPK.NZ', 'BTC', 'ETH', 'NZDUSD=X'];
+  let weights = Array(assets.length).fill(1 / assets.length);
+  const T = 1.0, T_min = 0.0001, alpha = 0.9;
+  const returns = assets.map(a => (prices[a] - (costBasis[a] || prices[a])) / (costBasis[a] || prices[a])); // Mock returns
+  const cov_matrix = Array(assets.length).fill().map(() => Array(assets.length).fill(0.01)); // Mock covariance
+
+  while (T > T_min) {
+    const new_weights = weights.map(w => Math.max(0, w + (Math.random() - 0.5) * 0.1));
+    const sum = new_weights.reduce((a, b) => a + b, 0);
+    new_weights = new_weights.map(w => w / sum);
+    const current_sharpe = calculateSharpeRatio(weights, returns, cov_matrix);
+    const new_sharpe = calculateSharpeRatio(new_weights, returns, cov_matrix);
+    if (new_sharpe > current_sharpe || Math.random() < Math.exp((new_sharpe - current_sharpe) / T)) {
+      weights = new_weights;
+    }
+    T *= alpha;
+  }
+
+  const new_holdings = {};
+  assets.forEach((a, i) => {
+    new_holdings[a] = (weights[i] * portfolio_value) / prices[a];
+  });
+  await db.query('UPDATE users SET holdings = $1 WHERE id = $2', [new_holdings, req.user.id]);
+  res.json({ success: true, new_holdings });
+});
+
+function calculateSharpeRatio(weights, returns, cov_matrix) {
+  const portfolio_return = weights.reduce((sum, w, i) => sum + w * returns[i], 0);
+  const portfolio_volatility = Math.sqrt(weights.reduce((sum, w1, i) =>
+    weights.reduce((inner, w2, j) => inner + w1 * w2 * cov_matrix[i][j], 0), 0));
+  return (portfolio_return - 0.02) / portfolio_volatility; // Assume 2% risk-free rate
+}
+
+// Market data endpoint
+app.get('/api/market-data', authenticateToken, async (req, res) => {
+  const cacheKey = `market_data_${req.user.id}`;
+  let data = await redisClient.get(cacheKey);
+  if (!data) {
+    try {
+      const [nzxResponse, cryptoResponse, forexResponse] = await Promise.all([
+        axios.get('https://api.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=SPK.NZ&interval=1min&apikey=YOUR_API_KEY'),
+        axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=bitcoin,ethereum,ripple'),
+        axios.get('https://api.alphavantage.co/query?function=FX_INTRADAY&from_symbol=NZD&to_symbol=USD&interval=1min&apikey=YOUR_API_KEY'),
+      ]);
+      const prices = {
+        'SPK.NZ': parseFloat(nzxResponse.data['Time Series (1min)'][Object.keys(nzxResponse.data['Time Series (1min)'])[0]]['4. close']),
+        'BTC': cryptoResponse.data.find(c => c.id === 'bitcoin').current_price,
+        'ETH': cryptoResponse.data.find(c => c.id === 'ethereum').current_price,
+        'XRP': cryptoResponse.data.find(c => c.id === 'ripple').current_price,
+        'NZDUSD=X': parseFloat(forexResponse.data['Time Series FX (1min)'][Object.keys(forexResponse.data['Time Series FX (1min)'])[0]]['4. close']),
+      };
+      const { rows } = await db.query('SELECT portfolio_value FROM users WHERE id = $1', [req.user.id]);
+      data = JSON.stringify({ portfolio_value: rows[0].portfolio_value, prices });
+      await redisClient.setEx(cacheKey, 60, data);
+    } catch (error) {
+      return res.status(500).json({ error: 'Failed to fetch market data' });
+    }
+  }
+  res.json(JSON.parse(data));
+});
+
+// Trade execution endpoint
+app.post('/api/trade', authenticateToken, async (req, res) => {
+  const { rows } = await db.query('SELECT plan, trades_left, portfolio_value, holdings FROM users WHERE id = $1', [req.user.id]);
+  const user = rows[0];
+  if (user.plan === 'free') {
+    if (user.trades_left <= 0) return res.status(403).json({ error: 'Trade limit reached' });
+    await db.query('UPDATE users SET trades_left = trades_left - 1 WHERE id = $1', [req.user.id]);
+  }
+
+  const { action, asset, amount } = req.body;
+  const priceResponse = await axios.get('https://api.supergrok.nz/api/market-data', { headers: { Authorization: req.headers.authorization } });
+  const price = priceResponse.data.prices[asset];
+
+  let holdings = user.holdings || { 'SPK.NZ': 100, 'BTC': 0.1, 'ETH': 0, 'XRP': 0, 'NZDUSD=X': 0 };
+  if (action === 'buy') {
+    const cost = price * amount;
+    if (user.portfolio_value >= cost) {
+      user.portfolio_value -= cost;
+      holdings[asset] = (holdings[asset] || 0) + amount;
+    } else {
+      return res.status(400).json({ error: 'Insufficient funds' });
+    }
+  } else if (action === 'sell') {
+    if (holdings[asset] >= amount) {
+      user.portfolio_value += price * amount;
+      holdings[asset] -= amount;
+    } else {
+      return res.status(400).json({ error: 'Insufficient holdings' });
+    }
+  }
+
+  await db.query('UPDATE users SET portfolio_value = $1, holdings = $2 WHERE id = $3', [user.portfolio_value, holdings, req.user.id]);
+  await db.query('INSERT INTO trades (user_id, asset, amount, action, price, timestamp) VALUES ($1, $2, $3, $4, $5, NOW())',
+    [req.user.id, asset, amount, action, price]);
+  res.json({ success: true, new_value: user.portfolio_value });
+});
+
+app.listen(3000, '0.0.0.0', () => console.log('Backend running on port 3000'));

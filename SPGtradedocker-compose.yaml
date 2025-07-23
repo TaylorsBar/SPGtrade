@@ -1,0 +1,46 @@
+version: '3.8'
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+      - "8081:8081"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PG_HOST=db
+      - PG_USER=postgres
+      - PG_PASSWORD=password
+      - PG_DATABASE=supergrok
+    depends_on:
+      - db
+      - redis
+  supergrok:
+    build:
+      context: ./supergrok
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    depends_on:
+      - backend
+  db:
+    image: postgres:14
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=supergrok
+    volumes:
+      - db-data:/var/lib/postgresql/data
+  redis:
+    image: redis:7
+volumes:
+  db-data:
